@@ -1,0 +1,14 @@
+# Asistent pacient – MVP gratuit
+
+## Ce face
+- Upload PDF/TXT pe pacient
+- Extrage text (PDF cu text încorporat)
+- Index TF-IDF per pacient
+- Q&A extractiv + citări (document:pagina)
+- Fișă minimă (alergii, medicații, labs) pe reguli simple
+
+## Rulare locală
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --reload
