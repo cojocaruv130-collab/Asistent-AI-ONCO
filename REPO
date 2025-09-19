@@ -1,0 +1,7 @@
+ai-pacienti-mvp/
+├─ app.py
+├─ utils.py
+├─ requirements.txt
+├─ render.yaml
+├─ .gitignore
+└─ README.md
