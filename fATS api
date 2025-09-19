@@ -1,0 +1,254 @@
+import os
+import json
+import uuid
+import shutil
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+import pdfplumber
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import pickle
+import re
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Asistent pacient MVP", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# ---------- Modele Pydantic ----------
+
+class AskRequest(BaseModel):
+    question: str
+
+# ---------- Utilitare simple ----------
+
+def safe_id() -> str:
+    return str(uuid.uuid4())
+
+def patient_dir(patient_id: str) -> Path:
+    p = DATA_DIR / "patients" / patient_id
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "attachments").mkdir(exist_ok=True)
+    (p / "chunks").mkdir(exist_ok=True)
+    return p
+
+def list_patients() -> List[str]:
+    root = DATA_DIR / "patients"
+    if not root.exists(): return []
+    return [d.name for d in root.iterdir() if d.is_dir()]
+
+def chunk_text(text: str, size: int = 800, overlap: int = 120) -> List[str]:
+    # simplu: rupem pe fraze/punctuație, apoi grupăm în bucăți
+    sents = re.split(r'(?<=[\.\!\?])\s+', text.strip())
+    chunks, buf = [], ""
+    for s in sents:
+        if len(buf) + len(s) <= size:
+            buf = (buf + " " + s).strip()
+        else:
+            if buf: chunks.append(buf)
+            # overlap: păstrăm finalul precedentului
+            tail = buf[-overlap:] if overlap and len(buf) > overlap else ""
+            buf = (tail + " " + s).strip()
+    if buf:
+        chunks.append(buf)
+    return [c for c in chunks if c.strip()]
+
+def extract_pdf_text_with_pages(pdf_path: Path) -> List[Dict[str, Any]]:
+    out = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            out.append({"page": i, "text": txt})
+    return out
+
+def save_json(path: Path, obj: Any):
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
+
+def get_index_paths(pdir: Path):
+    return pdir / "index.pkl", pdir / "tfidf.pkl", pdir / "meta.json"
+
+def build_or_update_index(patient_id: str):
+    pdir = patient_dir(patient_id)
+    chunks_dir = pdir / "chunks"
+    docs, metas = [], []
+
+    for jf in sorted(chunks_dir.glob("*.json")):
+        j = json.loads(jf.read_text(encoding="utf-8"))
+        docs.append(j["text"])
+        metas.append({"file_id": j["file_id"], "page": j["page"], "chunk_id": j["chunk_id"]})
+
+    if not docs:
+        raise HTTPException(status_code=400, detail="Nu există texte/chunks indexabile pentru acest pacient.")
+
+    vectorizer = TfidfVectorizer(max_features=40000, ngram_range=(1,2))
+    X = vectorizer.fit_transform(docs)
+
+    idx_path, tfidf_path, meta_path = get_index_paths(pdir)
+    with open(idx_path, "wb") as f:
+        pickle.dump(X, f)
+    with open(tfidf_path, "wb") as f:
+        pickle.dump(vectorizer, f)
+    save_json(meta_path, metas)
+
+def ensure_index(patient_id: str):
+    pdir = patient_dir(patient_id)
+    idx_path, tfidf_path, meta_path = get_index_paths(pdir)
+    if not (idx_path.exists() and tfidf_path.exists() and meta_path.exists()):
+        build_or_update_index(patient_id)
+
+def search_chunks(patient_id: str, query: str, top_k: int = 5):
+    pdir = patient_dir(patient_id)
+    idx_path, tfidf_path, meta_path = get_index_paths(pdir)
+    with open(idx_path, "rb") as f:
+        X = pickle.load(f)
+    with open(tfidf_path, "rb") as f:
+        vectorizer = pickle.load(f)
+    metas = load_json(meta_path, [])
+
+    q = vectorizer.transform([query])
+    sims = cosine_similarity(q, X).flatten()
+    order = sims.argsort()[::-1][:top_k]
+    results = []
+    for i in order:
+        results.append({
+            "score": float(sims[i]),
+            "meta": metas[i],
+            "text": (DATA_DIR / "patients" / patient_id / "chunks" / f"{metas[i]['chunk_id']}.json").read_text(encoding="utf-8")
+        })
+    # replace text with actual field only
+    for r in results:
+        j = json.loads(r["text"])
+        r["text"] = j["text"]
+    return results
+
+def naive_structuring(full_text: str) -> Dict[str, Any]:
+    # Reguli simple (MVP) – îmbunătățim după
+    allergies = re.findall(r'(alergi\w+.*?)(?:\n|;|\.)', full_text, flags=re.IGNORECASE)
+    meds = re.findall(r'((?:\b[A-Z][a-z]+(?:\s+\d+ ?mg)?)(?:\s*/\s*\d+ ?mg)?\s*(?:/zi|zilnic|seara|dimineața)?)', full_text)
+    labs = re.findall(r'(\bHbA1c\b.*?\d+(?:\.\d+)?%|\bcreatinin[ăa]\b.*?\d+(?:\.\d+)?\s*mg/dL|\bTGO\b|\bTGP\b|\bLDL\b.*?\d+)', full_text, flags=re.IGNORECASE)
+    return {
+        "allergies": list(set([a.strip() for a in allergies]))[:20],
+        "medications": list(set([m.strip() for m in meds]))[:30],
+        "labs": list(set([l.strip() for l in labs]))[:50],
+    }
+
+# ---------- Rute API ----------
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+@app.get("/patients")
+def get_patients():
+    ids = list_patients()
+    return {"patients": ids}
+
+@app.post("/patients/new")
+def create_patient(name: Optional[str] = Form(None)):
+    pid = safe_id()
+    pdir = patient_dir(pid)
+    profile = {"patient_id": pid, "name": name or "", "created": str(uuid.uuid1()), "attachments": []}
+    save_json(pdir / "profile.json", profile)
+    return {"patient_id": pid}
+
+@app.post("/patients/{patient_id}/upload")
+async def upload(patient_id: str, file: UploadFile = File(...)):
+    pdir = patient_dir(patient_id)
+    profile = load_json(pdir / "profile.json", {"patient_id": patient_id, "attachments": []})
+
+    ext = (Path(file.filename).suffix or "").lower()
+    if ext not in [".pdf", ".txt"]:
+        raise HTTPException(status_code=400, detail="Tip fișier neacceptat. Folosește PDF sau TXT pentru MVP.")
+
+    file_id = safe_id()
+    dest = pdir / "attachments" / f"{file_id}{ext}"
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    chunks_payloads = []
+    if ext == ".pdf":
+        pages = extract_pdf_text_with_pages(dest)
+        for page in pages:
+            ctexts = chunk_text(page["text"])
+            for j, ct in enumerate(ctexts):
+                chunk_id = f"{file_id}_p{page['page']}_{j}"
+                payload = {"chunk_id": chunk_id, "file_id": file_id, "page": page["page"], "text": ct}
+                save_json(pdir / "chunks" / f"{chunk_id}.json", payload)
+                chunks_payloads.append(payload)
+    else:
+        txt = dest.read_text(encoding="utf-8", errors="ignore")
+        for j, ct in enumerate(chunk_text(txt)):
+            chunk_id = f"{file_id}_t_{j}"
+            payload = {"chunk_id": chunk_id, "file_id": file_id, "page": 1, "text": ct}
+            save_json(pdir / "chunks" / f"{chunk_id}.json", payload)
+            chunks_payloads.append(payload)
+
+    # actualizează profil & index
+    profile["attachments"].append({"file_id": file_id, "filename": file.filename, "path": str(dest)})
+    save_json(pdir / "profile.json", profile)
+
+    # (re)indexare
+    build_or_update_index(patient_id)
+
+    # structurare foarte simplă din întreg textul fișierului
+    full_text = "\n".join([c["text"] for c in chunks_payloads])
+    struct = naive_structuring(full_text)
+    summary_path = pdir / "summary.json"
+    existing = load_json(summary_path, {"patient_id": patient_id, "allergies": [], "medications": [], "labs": []})
+    # merge simplu
+    existing["allergies"] = list(sorted(set(existing["allergies"] + struct["allergies"])))
+    existing["medications"] = list(sorted(set(existing["medications"] + struct["medications"])))
+    existing["labs"] = list(sorted(set(existing["labs"] + struct["labs"])))
+    save_json(summary_path, existing)
+
+    return {"ok": True, "file_id": file_id, "chunks": len(chunks_payloads)}
+
+@app.get("/patients/{patient_id}/summary")
+def get_summary(patient_id: str):
+    pdir = patient_dir(patient_id)
+    profile = load_json(pdir / "profile.json", None)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Pacient inexistent.")
+    summary = load_json(pdir / "summary.json", {"allergies": [], "medications": [], "labs": []})
+    return {"profile": profile, "summary": summary}
+
+@app.post("/patients/{patient_id}/ask")
+def ask_patient(patient_id: str, req: AskRequest):
+    ensure_index(patient_id)
+    hits = search_chunks(patient_id, req.question, top_k=5)
+
+    # Răspuns extractiv: returnăm cele mai relevante bucăți + citări
+    best_texts = [h["text"] for h in hits]
+    citations = [f"{h['meta']['file_id']}:{h['meta']['page']}" for h in hits]
+
+    answer = " • ".join([t.strip().replace("\n", " ")[:300] for t in best_texts if t.strip()][:3])
+    if not answer:
+        answer = "Nu am găsit informația în fișa acestui pacient."
+
+    return {
+        "question": req.question,
+        "answer": answer,
+        "citations": citations,
+        "debug_top": hits
+    }
