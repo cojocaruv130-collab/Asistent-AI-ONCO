@@ -1,0 +1,22 @@
+
+---
+
+## Cum îl testezi rapid (din browser)
+
+După deploy, mergi la:  
+`https://<linkul-tau>.onrender.com/docs`
+
+1) `POST /patients/new` → copiază `patient_id`  
+2) `POST /patients/{patient_id}/upload` → alege un **PDF** (nu scan; text încorporat) sau `.txt`  
+3) `POST /patients/{patient_id}/ask` → întreabă „Care e medicația?” / „Alergii?” / „Ultima HbA1c?”  
+4) vezi răspuns + `citations` (de forma `file_id:pagina`)  
+
+---
+
+### Notițe
+- Dacă ai **PDF-uri scanate / poze**, trebuie OCR (de ex. Tesseract + binar instalat). Putem adăuga un mic serviciu OCR separat sau să mutăm MVP-ul pe **Hugging Face Spaces (Gradio)** pentru demo cu OCR.  
+- Dacă vrei **răspunsuri naturale** (nu doar pasaje), activăm un LLM: setăm `OPENAI_API_KEY` în Render și adăugăm un mic layer în `ask` care rezumă top-chunks. Îl pot scrie când îmi spui.
+
+---
+
+Vrei să-ți scriu și un **fișier de test** (un PDF dummy) plus un mic **script front-end** (HTML simplu) ca să încarci fără Postman? Spune-mi și ți le pun.
